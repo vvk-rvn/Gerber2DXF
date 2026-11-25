@@ -1,0 +1,12 @@
+# build
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# conversion output / test data
+*_dxf/
+*.dxf
+gerber2dxf_log.txt
+*.zip
