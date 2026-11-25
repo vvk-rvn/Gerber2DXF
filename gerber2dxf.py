@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Gerber2DXF — конвертер Gerber (RS-274X / X2) и Excellon в DXF (мм).
 
-Запуск без аргументов           -> окно программы.
+Запуск без аргументов           -> окно программы (с превью слоёв).
 gerber2dxf.py input.zip [-o out] -> консольный режим.
 
 Вход: .zip (в т.ч. вложенные .zip), папка или отдельные файлы.
@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover
     ezdxf = None
 
-VERSION = "1.0"
+VERSION = "1.1"
 SKIP_EXT = {".gbrjob", ".json", ".ddw", ".tgz", ".gz", ".tar", ".pdf", ".png", ".jpg",
             ".jpeg", ".bmp", ".step", ".stp", ".kicad_pcb", ".kicad_pro", ".csv", ".xlsx",
             ".xls", ".html", ".dxf", ".exe", ".dll", ".rar", ".7z"}
@@ -42,26 +42,45 @@ SKIP_EXT = {".gbrjob", ".json", ".ddw", ".tgz", ".gz", ".tar", ".pdf", ".png", "
 # ----------------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------------
-def layer_color(name):
-    """AutoCAD color index by layer name (JLC short names and KiCad names)."""
+def layer_kind(name):
+    """Layer type by name: JLC short names, KiCad names, Protel extensions."""
     n = name.lower()
-    jlc = {"tl": 1, "bl": 5, "to": 7, "bo": 8, "ts": 3, "bs": 4, "drl": 2, "ko": 6,
-           "vcut": 30, "sk": 40, "gtp": 9, "gbp": 9, "npth": 30, "gko": 6, "gm1": 6}
+    jlc = {"tl": "top_cu", "bl": "bot_cu", "to": "top_silk", "bo": "bot_silk", "ts": "top_mask",
+           "bs": "bot_mask", "gtp": "top_paste", "gbp": "bot_paste", "drl": "drill", "npth": "npth",
+           "ko": "outline", "gko": "outline", "gm1": "outline", "vcut": "vcut"}
     if n in jlc:
         return jlc[n]
-    rules = [("npth", 30), ("pth", 2), ("drl", 2), ("drill", 2), ("edge", 6), ("outline", 6),
-             ("cuts", 6), ("f_cu", 1), ("f.cu", 1), ("top_cu", 1), ("b_cu", 5), ("b.cu", 5),
-             ("in", 150), ("mask", 3), ("silk", 7), ("paste", 9), ("fab", 252), ("user", 252)]
-    for key, col in rules:
+    exts = {".gtl": "top_cu", ".gbl": "bot_cu", ".gto": "top_silk", ".gbo": "bot_silk",
+            ".gts": "top_mask", ".gbs": "bot_mask", ".gtp": "top_paste", ".gbp": "bot_paste",
+            ".gko": "outline", ".gm1": "outline", ".drl": "drill", ".xln": "drill"}
+    if Path(n).suffix in exts:
+        return exts[Path(n).suffix]
+    if "npth" in n:
+        return "npth"
+    if "pth" in n or "drill" in n or n.endswith("drl"):
+        return "drill"
+    if "edge" in n or "outline" in n or "cuts" in n:
+        return "outline"
+    if "vcut" in n or "v-cut" in n:
+        return "vcut"
+    if re.search(r"(^|[_.\-])in\d+", n):
+        return "inner_cu"
+    bot = bool(re.search(r"(^|[_.\-])(b|bot|bottom)([_.\-]|$)", n))
+    for key, kind in (("cu", "cu"), ("copper", "cu"), ("mask", "mask"), ("silk", "silk"),
+                      ("legend", "silk"), ("paste", "paste")):
         if key in n:
-            if key == "mask" and ("b_" in n or "b." in n or "bot" in n):
-                return 4
-            if key == "silk" and ("b_" in n or "b." in n or "bot" in n):
-                return 8
-            return col
-    ext = {".gtl": 1, ".gbl": 5, ".gts": 3, ".gbs": 4, ".gto": 7, ".gbo": 8, ".gko": 6,
-           ".gm1": 6, ".gtp": 9, ".gbp": 9, ".drl": 2, ".xln": 2}
-    return ext.get(Path(n).suffix, 7)
+            return ("bot_" if bot else "top_") + kind
+    return "other"
+
+
+DXF_COLOR = {"top_cu": 1, "bot_cu": 5, "inner_cu": 40, "top_mask": 3, "bot_mask": 4,
+             "top_silk": 7, "bot_silk": 8, "top_paste": 9, "bot_paste": 9, "drill": 2,
+             "npth": 30, "outline": 6, "vcut": 30, "other": 252}
+
+
+def layer_color(name):
+    """AutoCAD color index for a layer."""
+    return DXF_COLOR[layer_kind(name)]
 
 
 def safe_layer(name):
@@ -74,8 +93,29 @@ class Shapes:
 
     def __init__(self, base_layer):
         self.base = base_layer
-        self.items = []  # (kind, layer_suffix, data...)
+        self.ftype = "gerber"  # or "excellon"
+        self.items = []  # (kind, clear, data...)
         self.stats = {"tracks": 0, "flashes": 0, "regions": 0, "holes": 0, "slots": 0}
+
+    def bbox(self):
+        x0 = y0 = math.inf
+        x1 = y1 = -math.inf
+        for it in self.items:
+            if it[0] == "c":
+                (x, y), r = it[2], it[3]
+                x0, y0, x1, y1 = min(x0, x - r), min(y0, y - r), max(x1, x + r), max(y1, y + r)
+            else:
+                for p in it[2]:
+                    x, y = p[0], p[1]
+                    if x < x0:
+                        x0 = x
+                    if x > x1:
+                        x1 = x
+                    if y < y0:
+                        y0 = y
+                    if y > y1:
+                        y1 = y
+        return None if x0 == math.inf else (x0, y0, x1, y1)
 
     def circle(self, clear, c, r):
         self.items.append(("c", clear, c, r))
@@ -619,46 +659,79 @@ def strip_common_prefix(stems):
     return {s: (s[len(pre):].strip("-_. ") or s) for s in stems}
 
 
-def convert_group(files, out_dir, log, per_layer=True, combined=True):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stems = [f.stem if f.suffix.lower() not in ("", ) else f.name for f in files]
+class Group:
+    """One Gerber set (one folder): parsed layers + where its DXF go."""
+
+    def __init__(self, title, out_rel, layers):
+        self.title = title
+        self.out_rel = out_rel
+        self.layers = layers
+
+
+def parse_group(files, log):
+    stems = [f.stem for f in files]
+    if len(set(s.lower() for s in stems)) < len(stems):  # e.g. board.GTL, board.GBL
+        stems = [f.name for f in files]
     short = strip_common_prefix(stems)
-    used, results = set(), []
+    used, layers = set(), []
     for f, stem in zip(files, stems):
         name = safe_layer(short[stem])
         if name.lower() in used:
             name = safe_layer(f"{name}{f.suffix.replace('.', '_')}")
         used.add(name.lower())
-        kind = classify(f)
+        ftype = classify(f)
         shapes = Shapes(name)
+        shapes.ftype = ftype
         text = f.read_text(encoding="latin-1")
         try:
-            (Gerber if kind == "gerber" else Excellon)(shapes, log).run(text)
+            (Gerber if ftype == "gerber" else Excellon)(shapes, log).run(text)
         except Exception as e:  # keep going with other layers
             log(f"    ОШИБКА в {f.name}: {e}")
             continue
         st = shapes.stats
-        if kind == "gerber":
+        if ftype == "gerber":
             log(f"    {name:<22} Gerber   дорожек {st['tracks']:>6}  площадок {st['flashes']:>5}  полигонов {st['regions']:>5}")
         else:
             log(f"    {name:<22} Excellon отверстий {st['holes']:>5}  пазов {st['slots']:>4}")
-        results.append(shapes)
-        if per_layer:
+        layers.append(shapes)
+    return layers
+
+
+def write_group(group, out_dir, log, per_layer=True, combined=True, only=None):
+    """Write DXF for a parsed group. only = set of layer names to keep (None = all)."""
+    if ezdxf is None:
+        raise RuntimeError("Не установлена библиотека ezdxf: python -m pip install ezdxf")
+    layers = [s for s in group.layers if only is None or s.base in only]
+    if not layers:
+        return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if per_layer:
+        for shapes in layers:
             doc = ezdxf.new("R2010", setup=True, units=4)
             shapes.emit(doc)
-            doc.saveas(out_dir / f"{name}.dxf")
-    if combined and results:
+            doc.saveas(out_dir / f"{shapes.base}.dxf")
+    if combined:
         doc = ezdxf.new("R2010", setup=True, units=4)
-        for shapes in results:
+        for shapes in layers:
             shapes.emit(doc)
         doc.saveas(out_dir / "ALL_LAYERS.dxf")
-    return len(results)
+    log(f"  Записано слоёв: {len(layers)}  ->  {out_dir}")
+    return len(layers)
 
 
 def convert(inputs, out_root, log=print, per_layer=True, combined=True):
+    total = 0
+    for g in load(inputs, log):
+        total += write_group(g, Path(out_root) / g.out_rel, log, per_layer, combined)
+    log(f"Готово: слоёв конвертировано {total}.")
+    return total
+
+
+def load(inputs, log=print):
+    """Find and parse all Gerber/Excellon sets in the inputs. Returns [Group]."""
     if ezdxf is None:
         raise RuntimeError("Не установлена библиотека ezdxf: python -m pip install ezdxf")
-    total = 0
+    result = []
     for inp in inputs:
         inp = Path(inp)
         log(f"Вход: {inp}")
@@ -683,22 +756,370 @@ def convert(inputs, out_root, log=print, per_layer=True, combined=True):
             if not groups:
                 log("  Gerber/Excellon файлов не найдено")
                 continue
-            base = out_root if len(inputs) == 1 else out_root / safe_layer(inp.stem)
+            base = Path(".") if len(inputs) == 1 else Path(safe_layer(inp.stem))
             for folder, gfiles in sorted(groups.items()):
                 rel = Path(".") if root is None or folder == root else folder.relative_to(root)
-                out_dir = base / rel
-                log(f"  Набор: {rel.as_posix() if str(rel) != '.' else '(корень)'}  ->  {out_dir}")
-                total += convert_group(gfiles, out_dir, log, per_layer, combined)
+                rel_txt = rel.as_posix() if str(rel) != "." else "(корень)"
+                log(f"  Набор: {rel_txt}")
+                layers = parse_group(gfiles, log)
+                if layers:
+                    title = rel_txt if len(inputs) == 1 else f"{inp.name} / {rel_txt}"
+                    result.append(Group(title, base / rel, layers))
         finally:
             if tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
-    log(f"Готово: слоёв конвертировано {total}.")
-    return total
+    return result
 
 
 def default_out(inp):
     p = Path(inp)
     return p.parent / (p.stem + "_dxf")
+
+
+# ----------------------------------------------------------------------------
+# Preview window
+# ----------------------------------------------------------------------------
+PREVIEW_BG = "#0e1116"
+# kind -> (color, draw mode, z-order: lower is drawn first)
+PREVIEW_STYLE = {
+    "bot_silk": ("#b9a2e0", "fill", 0), "bot_paste": ("#8f8fb0", "outline", 1),
+    "bot_mask": ("#2fa3a3", "outline", 2), "bot_cu": ("#4a6fe0", "fill", 3),
+    "inner_cu": ("#d6a43a", "fill", 4), "top_cu": ("#d9493e", "fill", 5),
+    "top_paste": ("#b0b0b0", "outline", 6), "top_mask": ("#39b54a", "outline", 7),
+    "top_silk": ("#f2f2f2", "fill", 8), "other": ("#9aa0a6", "fill", 9),
+    "vcut": ("#ff6ec7", "fill", 10), "outline": ("#f0e04a", "fill", 11),
+    "npth": ("#ff9a2e", "outline", 12), "drill": ("#35d0e0", "outline", 13),
+}
+
+
+def flatten(pts, closed):
+    """[(x, y, bulge)] -> [(x, y)] with arcs split into short segments."""
+    out = []
+    n = len(pts)
+    for i, (x, y, b) in enumerate(pts):
+        out.append((x, y))
+        if not b or (i + 1 == n and not closed):
+            continue
+        x2, y2 = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+        dx, dy = x2 - x, y2 - y
+        chord = math.hypot(dx, dy)
+        if chord < 1e-12:
+            continue
+        theta = 4 * math.atan(b)
+        off = (chord / 2) * math.cos(theta / 2) / math.sin(theta / 2)
+        cx, cy = (x + x2) / 2 - dy / chord * off, (y + y2) / 2 + dx / chord * off
+        r = math.hypot(x - cx, y - cy)
+        a0 = math.atan2(y - cy, x - cx)
+        steps = max(2, int(abs(theta) / (math.pi / 16)))
+        for k in range(1, steps):
+            a = a0 + theta * k / steps
+            out.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return out
+
+
+class Preview:
+    """Toplevel window: all layers of the parsed groups, toggled by checkboxes."""
+
+    CHUNK = 1500  # items drawn between UI updates
+
+    def __init__(self, master, groups, get_out, get_opts, log, post):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk, self.ttk = tk, ttk
+        self.groups, self.get_out, self.get_opts, self.log, self.post = groups, get_out, get_opts, log, post
+        self.vis = [[tk.BooleanVar(value=True) for _ in g.layers] for g in groups]
+        self.boxes = [[s.bbox() for s in g.layers] for g in groups]
+        self.gi, self.gen = 0, 0
+        self.s, self.tx, self.ty = 1.0, 0.0, 0.0
+        self.widths = {}
+        self.drag = None
+        self.last_out = None
+
+        w = self.win = tk.Toplevel(master)
+        w.title(f"Превью слоёв — Gerber → DXF v{VERSION}")
+        fit_geometry(w, 1250, 800)
+        w.minsize(700, 450)
+        w.protocol("WM_DELETE_WINDOW", self.close)
+
+        top = ttk.Frame(w, padding=(8, 6))
+        top.pack(side="top", fill="x")
+        ttk.Label(top, text="Набор:").pack(side="left")
+        self.combo = ttk.Combobox(top, state="readonly", width=40, values=[g.title for g in groups])
+        self.combo.current(0)
+        self.combo.pack(side="left", padx=(4, 12))
+        self.combo.bind("<<ComboboxSelected>>", lambda e: self.select_group(self.combo.current()))
+        ttk.Button(top, text="Вписать", command=self.fit).pack(side="left")
+        ttk.Button(top, text="Все слои", command=lambda: self.set_all(True)).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Ни одного", command=lambda: self.set_all(False)).pack(side="left", padx=4)
+        self.open_btn = ttk.Button(top, text="Открыть папку", command=self.open_folder, state="disabled")
+        self.open_btn.pack(side="right")
+        self.save_btn = ttk.Button(top, text="Сохранить DXF (отмеченные слои)", command=self.export)
+        self.save_btn.pack(side="right", padx=6)
+
+        status = ttk.Frame(w, padding=(8, 3))
+        status.pack(side="bottom", fill="x")
+        self.coord = ttk.Label(status, text="X —  Y —", width=30)
+        self.coord.pack(side="left")
+        self.status = ttk.Label(status, text="")
+        self.status.pack(side="left", padx=10)
+        ttk.Label(status, text="Колесо — масштаб · перетаскивание — сдвиг · двойной клик — вписать",
+                  foreground="#777").pack(side="right")
+
+        body = ttk.Frame(w)
+        body.pack(fill="both", expand=True)
+        side = ttk.Frame(body, padding=(8, 4))
+        side.pack(side="left", fill="y")
+        ttk.Label(side, text="Слои", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
+        self.list = ttk.Frame(side)
+        self.list.pack(fill="y", anchor="n")
+
+        c = self.canvas = tk.Canvas(body, bg=PREVIEW_BG, highlightthickness=0, cursor="crosshair")
+        c.pack(side="left", fill="both", expand=True)
+        c.bind("<MouseWheel>", lambda e: self.zoom_at(e.x, e.y, 1.25 if e.delta > 0 else 0.8))
+        c.bind("<Button-4>", lambda e: self.zoom_at(e.x, e.y, 1.25))  # X11
+        c.bind("<Button-5>", lambda e: self.zoom_at(e.x, e.y, 0.8))
+        for b in ("1", "2", "3"):
+            c.bind(f"<ButtonPress-{b}>", self.drag_start)
+            c.bind(f"<B{b}-Motion>", self.drag_move)
+        c.bind("<Double-Button-1>", lambda e: self.fit())
+        c.bind("<Motion>", self.motion)
+        w.after(60, lambda: self.select_group(0))
+
+    # --- helpers --------------------------------------------------------
+    def style(self, shapes):
+        return PREVIEW_STYLE[layer_kind(shapes.base)]
+
+    def close(self):
+        self.gen += 1
+        self.win.destroy()
+
+    def set_status(self, text):
+        self.status.configure(text=text)
+
+    def visible_bbox(self):
+        boxes = [b for b, v in zip(self.boxes[self.gi], self.vis[self.gi]) if b and v.get()]
+        boxes = boxes or [b for b in self.boxes[self.gi] if b]
+        if not boxes:
+            return (0, 0, 10, 10)
+        return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    def fit_transform(self):
+        self.canvas.update_idletasks()
+        W, H = max(self.canvas.winfo_width(), 100), max(self.canvas.winfo_height(), 100)
+        x0, y0, x1, y1 = self.visible_bbox()
+        s = min((W - 40) / max(x1 - x0, 1e-6), (H - 40) / max(y1 - y0, 1e-6))
+        return s, W / 2 - (x0 + x1) / 2 * s, H / 2 + (y0 + y1) / 2 * s
+
+    def update_widths(self):
+        for w, tag in self.widths.items():
+            self.canvas.itemconfigure(tag, width=max(1.0, w * self.s))
+
+    def width_tag(self, w):
+        key = round(w, 5)
+        if key not in self.widths:
+            self.widths[key] = f"W{len(self.widths)}"
+        return self.widths[key]
+
+    # --- view -----------------------------------------------------------
+    def zoom_at(self, cx, cy, f):
+        self.canvas.scale("all", cx, cy, f, f)
+        self.s *= f
+        self.tx = (self.tx - cx) * f + cx
+        self.ty = (self.ty - cy) * f + cy
+        self.update_widths()
+
+    def fit(self):
+        s2, tx2, ty2 = self.fit_transform()
+        f = s2 / self.s
+        self.canvas.scale("all", 0, 0, f, f)
+        self.canvas.move("all", tx2 - self.tx * f, ty2 - self.ty * f)
+        self.s, self.tx, self.ty = s2, tx2, ty2
+        self.update_widths()
+
+    def drag_start(self, e):
+        self.drag = (e.x, e.y)
+
+    def drag_move(self, e):
+        if self.drag:
+            dx, dy = e.x - self.drag[0], e.y - self.drag[1]
+            self.canvas.move("all", dx, dy)
+            self.tx += dx
+            self.ty += dy
+            self.drag = (e.x, e.y)
+
+    def motion(self, e):
+        x, y = (e.x - self.tx) / self.s, -(e.y - self.ty) / self.s
+        self.coord.configure(text=f"X {x:9.3f}   Y {y:9.3f} мм")
+
+    # --- layers ---------------------------------------------------------
+    def select_group(self, gi):
+        tk, ttk = self.tk, self.ttk
+        self.gi = gi
+        g = self.groups[gi]
+        for child in self.list.winfo_children():
+            child.destroy()
+        order = sorted(range(len(g.layers)), key=lambda i: -self.style(g.layers[i])[2])
+        for i in order:
+            shapes = g.layers[i]
+            row = ttk.Frame(self.list)
+            row.pack(anchor="w", fill="x", pady=1)
+            tk.Label(row, bg=self.style(shapes)[0], width=2, relief="flat").pack(side="left", padx=(0, 6))
+            ttk.Checkbutton(row, text=f"{shapes.base}  ({len(shapes.items)})", variable=self.vis[gi][i],
+                            command=lambda i=i: self.toggle(i)).pack(side="left")
+        self.redraw()
+
+    def toggle(self, i):
+        state = "normal" if self.vis[self.gi][i].get() else "hidden"
+        self.canvas.itemconfigure(f"L{i}", state=state)
+
+    def set_all(self, on):
+        for i, v in enumerate(self.vis[self.gi]):
+            v.set(on)
+            self.toggle(i)
+
+    def redraw(self):
+        self.gen += 1
+        self.canvas.delete("all")
+        self.widths = {}
+        self.s, self.tx, self.ty = self.fit_transform()
+        it = self.draw_iter(self.gen)
+        self.win.after(1, self.pump, self.gen, it)
+
+    def pump(self, gen, it):
+        if gen != self.gen:
+            return
+        try:
+            next(it)
+            self.win.after(1, self.pump, gen, it)
+        except StopIteration:
+            pass
+
+    def draw_iter(self, gen):
+        g = self.groups[self.gi]
+        order = sorted(range(len(g.layers)), key=lambda i: self.style(g.layers[i])[2])
+        total = max(1, sum(len(s.items) for s in g.layers))
+        done = 0
+        for i in order:
+            for n in self.draw_layer(i, g.layers[i]):
+                done += n
+                self.set_status(f"Отрисовка… {min(100, done * 100 // total)}%")
+                yield
+        n_items = len(self.canvas.find_all())
+        self.set_status(f"{g.title}: слоёв {len(g.layers)}, объектов {n_items}")
+
+    def draw_layer(self, i, shapes):
+        c = self.canvas
+        color, mode, _ = self.style(shapes)
+        tag = f"L{i}"
+        state = "normal" if self.vis[self.gi][i].get() else "hidden"
+        count = 0
+        for it in shapes.items:
+            clear = it[1]
+            col = PREVIEW_BG if clear else color
+            s, tx, ty = self.s, self.tx, self.ty
+            if it[0] == "c":
+                (x, y), r = it[2], it[3]
+                px, py, pr = x * s + tx, -y * s + ty, max(r * s, 0.5)
+                if mode == "fill":
+                    c.create_oval(px - pr, py - pr, px + pr, py + pr, fill=col, outline="", tags=tag, state=state)
+                elif not clear:
+                    c.create_oval(px - pr, py - pr, px + pr, py + pr, outline=col, tags=tag, state=state)
+            else:
+                _, _, pts, closed, width, bulge = it
+                flat = flatten(pts, closed) if bulge else pts
+                coords = []
+                for p in flat:
+                    coords.append(p[0] * s + tx)
+                    coords.append(-p[1] * s + ty)
+                if closed:
+                    if len(coords) >= 6:
+                        if mode == "fill":
+                            c.create_polygon(coords, fill=col, outline="", tags=tag, state=state)
+                        elif not clear:
+                            c.create_polygon(coords, fill="", outline=col, tags=tag, state=state)
+                elif len(coords) >= 4:
+                    if mode == "fill" and width > 0:
+                        c.create_line(coords, fill=col, width=max(1.0, width * s), capstyle="round",
+                                      joinstyle="round", tags=(tag, self.width_tag(width)), state=state)
+                    elif not clear:
+                        c.create_line(coords, fill=col, width=1, tags=tag, state=state)
+            count += 1
+            if count % self.CHUNK == 0:
+                yield self.CHUNK
+        yield count % self.CHUNK
+
+    # --- export ---------------------------------------------------------
+    def export(self):
+        from tkinter import messagebox
+        g = self.groups[self.gi]
+        only = {s.base for s, v in zip(g.layers, self.vis[self.gi]) if v.get()}
+        if not only:
+            messagebox.showwarning("Gerber → DXF", "Отметьте хотя бы один слой.", parent=self.win)
+            return
+        per, comb = self.get_opts()
+        if not (per or comb):
+            messagebox.showwarning("Gerber → DXF", "В главном окне отметьте хотя бы один вариант вывода.",
+                                   parent=self.win)
+            return
+        out_dir = Path(self.get_out()) / g.out_rel
+        self.save_btn.configure(state="disabled")
+        self.set_status(f"Сохранение {len(only)} слоёв…")
+
+        def work():
+            try:
+                n = write_group(g, out_dir, self.log, per, comb, only)
+                self.post(lambda: self.saved(out_dir, n))
+            except Exception as e:  # noqa
+                self.post(lambda err=str(e): self.failed(err))
+        threading.Thread(target=work, daemon=True).start()
+
+    def saved(self, out_dir, n):
+        self.last_out = out_dir
+        self.save_btn.configure(state="normal")
+        self.open_btn.configure(state="normal")
+        self.set_status(f"Сохранено слоёв: {n}  →  {out_dir}")
+
+    def failed(self, err):
+        from tkinter import messagebox
+        self.save_btn.configure(state="normal")
+        self.set_status("Ошибка сохранения")
+        messagebox.showerror("Gerber → DXF", err, parent=self.win)
+
+    def open_folder(self):
+        if self.last_out:
+            open_path(self.last_out)
+
+
+def dpi_aware():
+    """Crisp rendering on Windows with 125-200 % display scaling."""
+    if sys.platform.startswith("win"):
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:  # noqa
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:  # noqa
+                pass
+
+
+def ui_scale(widget):
+    return max(1.0, widget.winfo_fpixels("1i") / 96.0)
+
+
+def fit_geometry(win, w, h):
+    k = ui_scale(win)
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{min(int(w * k), int(sw * 0.9))}x{min(int(h * k), int(sh * 0.8))}")
+
+
+def open_path(p):
+    if sys.platform.startswith("win"):
+        os.startfile(str(p))  # noqa
+    else:
+        import subprocess
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
 
 
 # ----------------------------------------------------------------------------
@@ -709,9 +1130,10 @@ def run_gui(prefill=None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
+    dpi_aware()
     root = tk.Tk()
     root.title(f"Gerber → DXF  v{VERSION}")
-    root.geometry("820x560")
+    fit_geometry(root, 860, 560)
     root.minsize(640, 420)
     q = queue.Queue()
     in_var, out_var = tk.StringVar(), tk.StringVar()
@@ -753,8 +1175,10 @@ def run_gui(prefill=None):
 
     act = ttk.Frame(frm)
     act.grid(row=3, column=0, columnspan=3, sticky="ew", pady=8)
-    go = ttk.Button(act, text="Конвертировать")
-    go.pack(side="left")
+    prev = ttk.Button(act, text="Превью слоёв…")
+    prev.pack(side="left")
+    go = ttk.Button(act, text="Конвертировать всё")
+    go.pack(side="left", padx=(8, 0))
     open_btn = ttk.Button(act, text="Открыть папку вывода", state="disabled")
     open_btn.pack(side="left", padx=8)
     bar = ttk.Progressbar(act, mode="indeterminate")
@@ -770,6 +1194,9 @@ def run_gui(prefill=None):
     def log(msg):
         q.put(("log", msg))
 
+    def post(fn):
+        q.put(("call", fn))
+
     def worker(inp, out, per, comb):
         try:
             n = convert([inp], Path(out), log, per, comb)
@@ -777,33 +1204,55 @@ def run_gui(prefill=None):
         except Exception as e:  # noqa
             q.put(("error", str(e)))
 
-    def start():
+    def preview_worker(inp):
+        try:
+            groups = load([inp], log)
+            if not groups:
+                q.put(("error", "Gerber/Excellon файлов не найдено."))
+                return
+            n = sum(len(g.layers) for g in groups)
+            log(f"Загружено: наборов {len(groups)}, слоёв {n}. Открываю превью…")
+            q.put(("done", 0))
+            post(lambda: Preview(root, groups, lambda: out_var.get().strip().strip('"') or default_out(inp),
+                                 lambda: (per_var.get(), all_var.get()), log, post))
+        except Exception as e:  # noqa
+            q.put(("error", str(e)))
+
+    def check_inputs(need_opts=True):
         inp, out = in_var.get().strip().strip('"'), out_var.get().strip().strip('"')
         if not inp or not Path(inp).exists():
             messagebox.showwarning("Gerber → DXF", "Выберите zip-архив или папку с Gerber.")
-            return
+            return None
         if not out:
-            out = str(default_out(inp))
-            out_var.set(out)
-        if not (per_var.get() or all_var.get()):
+            out_var.set(str(default_out(inp)))
+        if need_opts and not (per_var.get() or all_var.get()):
             messagebox.showwarning("Gerber → DXF", "Отметьте хотя бы один вариант вывода.")
-            return
+            return None
+        return inp
+
+    def busy():
         logbox.delete("1.0", "end")
         go.configure(state="disabled")
+        prev.configure(state="disabled")
         open_btn.configure(state="disabled")
         bar.start(12)
-        threading.Thread(target=worker, args=(inp, out, per_var.get(), all_var.get()), daemon=True).start()
 
-    def open_out():
-        p = out_var.get()
-        if sys.platform.startswith("win"):
-            os.startfile(p)  # noqa
-        else:
-            import subprocess
-            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", p])
+    def start():
+        inp = check_inputs()
+        if inp:
+            busy()
+            threading.Thread(target=worker, args=(inp, out_var.get(), per_var.get(), all_var.get()),
+                             daemon=True).start()
+
+    def start_preview():
+        inp = check_inputs(need_opts=False)
+        if inp:
+            busy()
+            threading.Thread(target=preview_worker, args=(inp,), daemon=True).start()
 
     go.configure(command=start)
-    open_btn.configure(command=open_out)
+    prev.configure(command=start_preview)
+    open_btn.configure(command=lambda: open_path(out_var.get()))
 
     def poll():
         try:
@@ -812,9 +1261,16 @@ def run_gui(prefill=None):
                 if kind == "log":
                     logbox.insert("end", val + "\n")
                     logbox.see("end")
+                elif kind == "call":
+                    try:
+                        val()
+                    except Exception as e:  # noqa
+                        logbox.insert("end", f"ОШИБКА: {e}\n")
+                        messagebox.showerror("Gerber → DXF", str(e))
                 else:
                     bar.stop()
                     go.configure(state="normal")
+                    prev.configure(state="normal")
                     if kind == "done" and val:
                         open_btn.configure(state="normal")
                     elif kind == "error":
